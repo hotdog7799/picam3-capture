@@ -1,0 +1,11 @@
+[project]
+name = "new-capturecode"
+version = "0.1.0"
+description = "Raspberry Pi Camera Control with picam_v4"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "matplotlib>=3.6",
+    "numpy<2",
+]
