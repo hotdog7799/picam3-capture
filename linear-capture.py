@@ -14,6 +14,11 @@ PNG preview:
 
 The PNG preview is not meant for reconstruction. Use the .npy/.npz files for
 PSF preprocessing and forward models.
+
+Interactive commands include `hhh`, which searches for the exposure time that
+fills a target fraction of the sensor range without clipping, then captures and
+logs with it. It replaces the manual "change exposure, press h, look at the
+histogram, repeat" loop.
 """
 
 from __future__ import annotations
@@ -59,6 +64,28 @@ DEFAULT_CONFIG = {
     "serial_timeout": 1.0,
     "warmup": 0.2,
     "tuning_path": str(DEFAULT_TUNING_PATH),
+    # Auto exposure search ("hhh") parameters.
+    "auto_target_fill": 0.85,
+    "auto_fill_low": 0.70,
+    "auto_fill_high": 0.92,
+    "auto_max_saturated_pixels": 0,
+    "auto_max_iterations": 12,
+    "auto_exposure_min": 100,
+    "auto_exposure_max": 2000000,
+    "auto_peak_pixels": 64,
+    "auto_save_histogram": True,
+}
+
+AUTO_SETUP_FIELDS = {
+    "auto_target_fill",
+    "auto_fill_low",
+    "auto_fill_high",
+    "auto_max_saturated_pixels",
+    "auto_max_iterations",
+    "auto_exposure_min",
+    "auto_exposure_max",
+    "auto_peak_pixels",
+    "auto_save_histogram",
 }
 
 RUNTIME_SETUP_FIELDS = {
@@ -78,7 +105,7 @@ RECONFIGURE_SETUP_FIELDS = {
     "enable_preview",
 }
 
-ALLOWED_SETUP_FIELDS = RUNTIME_SETUP_FIELDS | RECONFIGURE_SETUP_FIELDS
+ALLOWED_SETUP_FIELDS = RUNTIME_SETUP_FIELDS | RECONFIGURE_SETUP_FIELDS | AUTO_SETUP_FIELDS
 
 
 def has_display() -> bool:
@@ -209,17 +236,30 @@ def split_cfa_planes(raw_float: np.ndarray, pattern: str) -> dict[str, np.ndarra
     }
 
 
-def demosaic_linear_preview(raw_float: np.ndarray, bit_depth: int, pattern: str) -> np.ndarray:
+def demosaic_linear_preview(
+    raw_float: np.ndarray,
+    bit_depth: int,
+    pattern: str
+) -> np.ndarray:
+
     max_value = float((1 << bit_depth) - 1)
+
     raw16 = np.clip(raw_float, 0, max_value)
-    raw16 = np.round(raw16 * (65535.0 / max_value)).astype(np.uint16)
+    raw16 = np.round(
+        raw16 * (65535.0 / max_value)
+    ).astype(np.uint16)
+
     code_map = {
-        "RGGB": cv2.COLOR_BayerRG2RGB,
-        "BGGR": cv2.COLOR_BayerBG2RGB,
-        "GRBG": cv2.COLOR_BayerGR2RGB,
-        "GBRG": cv2.COLOR_BayerGB2RGB,
+        "RGGB": cv2.COLOR_BayerRGGB2RGB,
+        "BGGR": cv2.COLOR_BayerBGGR2RGB,
+        "GRBG": cv2.COLOR_BayerGRBG2RGB,
+        "GBRG": cv2.COLOR_BayerGBRG2RGB,
     }
-    return cv2.cvtColor(raw16, code_map[pattern.upper()])
+
+    return cv2.cvtColor(
+        raw16,
+        code_map[pattern.upper()]
+    )
 
 
 def robust_preview_png(rgb16: np.ndarray) -> np.ndarray:
@@ -373,6 +413,102 @@ def saturation_limits_from_stats(stats: dict) -> dict[str, float]:
         for channel, values in stats.get("channels", {}).items()
     }
 
+def robust_plane_peak(plane: np.ndarray, top_k: int) -> float:
+    """Median of the top-k pixels: tracks a small bright spot without following hot pixels."""
+    flat = plane.reshape(-1)
+    k = int(max(1, min(int(top_k), flat.size)))
+    if k == 1:
+        return float(flat.max())
+    top = np.partition(flat, flat.size - k)[flat.size - k :]
+    return float(np.median(top))
+
+
+def measure_exposure_metrics(
+    raw: np.ndarray,
+    metadata: dict,
+    bit_depth: int,
+    pattern: str,
+    top_k: int,
+) -> dict:
+    """Per-channel headroom of a probe frame, without writing anything to disk."""
+    domain = detect_raw_domain(raw, bit_depth)
+    black_levels = get_black_levels(metadata, bit_depth, domain)
+    scale = raw_scale_for_domain(domain, bit_depth)
+    native_max = float((1 << bit_depth) - 1)
+    sensor_max_raw = native_max * scale
+    black_by_channel = {
+        "R": black_levels[0],
+        "G1": black_levels[1],
+        "G2": black_levels[2],
+        "B": black_levels[3],
+    }
+
+    channels = {}
+    fill = 0.0
+    peak_channel = None
+    saturated_pixels = 0
+    total_pixels = 0
+    for channel, (row0, col0) in cfa_index_map(pattern).items():
+        plane = raw[row0::2, col0::2]
+        black_native = float(black_by_channel[channel]) / scale
+        limit = max(native_max - black_native, 1.0)
+        peak_signal = max(robust_plane_peak(plane, top_k) / scale - black_native, 0.0)
+        max_signal = max(float(plane.max()) / scale - black_native, 0.0)
+        channel_saturated = int((plane >= sensor_max_raw).sum())
+        channel_fill = peak_signal / limit
+        channels[channel] = {
+            "peak_signal": peak_signal,
+            "max_signal": max_signal,
+            "signal_saturation_limit": limit,
+            "fill": channel_fill,
+            "max_fill": max_signal / limit,
+            "saturated_pixel_count": channel_saturated,
+        }
+        saturated_pixels += channel_saturated
+        total_pixels += int(plane.size)
+        if channel_fill > fill:
+            fill = channel_fill
+            peak_channel = channel
+
+    return {
+        "fill": fill,
+        "peak_channel": peak_channel,
+        "saturated_pixels": saturated_pixels,
+        "saturated_fraction": saturated_pixels / total_pixels if total_pixels else 0.0,
+        "raw_max": int(raw.max()),
+        "bit_depth": bit_depth,
+        "raw_domain": domain,
+        "channels": channels,
+    }
+
+
+def predict_exposure(
+    exposure_us: float,
+    metrics: dict,
+    target_fill: float,
+    max_saturated_pixels: int,
+    clipped_streak: int = 0,
+) -> float:
+    """Linear-sensor prediction of the exposure that lands `fill` on `target_fill`."""
+    if metrics["saturated_pixels"] > max_saturated_pixels:
+        # Clipped: the measured fill only says "at least the ceiling", so it cannot
+        # predict how far down to go. Shrink by how much of the frame is pinned, and
+        # escalate while consecutive probes keep clipping so a wildly over-exposed
+        # start does not crawl down one small step per frame.
+        saturated_fraction = metrics["saturated_fraction"]
+        if saturated_fraction > 1e-2:
+            ratio = 0.35
+        elif saturated_fraction > 1e-3:
+            ratio = 0.60
+        else:
+            ratio = min(0.80, target_fill)
+        ratio *= 0.5 ** max(0, clipped_streak - 1)
+    else:
+        ratio = target_fill / max(metrics["fill"], 1e-4)
+    ratio = float(np.clip(ratio, 1.0 / 8.0, 8.0))
+    return exposure_us * ratio
+
+
 def write_float32_tiff_best_effort(path: Path, rgb16: np.ndarray) -> bool:
     rgb_float = rgb16.astype(np.float32) / 65535.0
     bgr_float = cv2.cvtColor(rgb_float, cv2.COLOR_RGB2BGR)
@@ -404,10 +540,10 @@ def json_safe(obj):
 def ensure_dirs(root: Path) -> dict[str, Path]:
     dirs = {
         "raw": root / "raw",
-        "linear": root / "linear",
+        # "linear": root / "linear",
         "planes": root / "planes",
         "preview": root / "preview",
-        "tiff": root / "tiff",
+        # "tiff": root / "tiff",
         "log": root / "log",
     }
     for path in dirs.values():
@@ -468,17 +604,17 @@ def capture_once(args) -> dict:
         stem = sanitize_filename(args.name)
 
         raw_path = dirs["raw"] / f"{stem}.raw_uint.npy"
-        linear_path = dirs["linear"] / f"{stem}.linear_float32.npy"
+        # linear_path = dirs["linear"] / f"{stem}.linear_float32.npy"
         planes_path = dirs["planes"] / f"{stem}.planes_float32.npz"
         preview_path = dirs["preview"] / f"{stem}.preview.png"
-        tiff_path = dirs["tiff"] / f"{stem}.linear_float32.tiff"
+        # tiff_path = dirs["tiff"] / f"{stem}.linear_float32.tiff"
         meta_path = dirs["log"] / f"{stem}.metadata.json"
 
         np.save(raw_path, raw)
-        np.save(linear_path, linear.astype(np.float32, copy=False))
+        # np.save(linear_path, linear.astype(np.float32, copy=False))
         np.savez_compressed(planes_path, **planes)
         cv2.imwrite(str(preview_path), cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
-        tiff_ok = write_float32_tiff_best_effort(tiff_path, rgb16)
+        # tiff_ok = write_float32_tiff_best_effort(tiff_path, rgb16)
 
         payload = {
             "name": stem,
@@ -498,10 +634,10 @@ def capture_once(args) -> dict:
             "saturation": saturation_stats,
             "paths": {
                 "raw_uint_npy": str(raw_path),
-                "linear_float32_npy": str(linear_path),
+                # "linear_float32_npy": str(linear_path),
                 "planes_float32_npz": str(planes_path),
                 "preview_png": str(preview_path),
-                "linear_float32_tiff": str(tiff_path) if tiff_ok else None,
+                # "linear_float32_tiff": str(tiff_path) if tiff_ok else None,
                 "metadata_json": str(meta_path),
             },
         }
@@ -558,11 +694,26 @@ def parse_bool(value: str) -> bool:
 def parse_config_value(key: str, value: str):
     if key == "bit_depth":
         return str(normalize_bit_depth(value))
-    if key in {"camera_index", "exposure_time"}:
+    if key in {
+        "camera_index",
+        "exposure_time",
+        "auto_max_saturated_pixels",
+        "auto_max_iterations",
+        "auto_exposure_min",
+        "auto_exposure_max",
+        "auto_peak_pixels",
+    }:
         return int(value)
-    if key in {"analogue_gain", "serial_timeout", "warmup"}:
+    if key in {
+        "analogue_gain",
+        "serial_timeout",
+        "warmup",
+        "auto_target_fill",
+        "auto_fill_low",
+        "auto_fill_high",
+    }:
         return float(value)
-    if key in {"ae_enable", "awb_enable", "enable_preview"}:
+    if key in {"ae_enable", "awb_enable", "enable_preview", "auto_save_histogram"}:
         return parse_bool(value)
     if key in {"preview_size", "colour_gains"}:
         parts = [part.strip() for part in value.split("|")]
@@ -647,6 +798,7 @@ class InteractiveCameraController:
         self.raw_config = None
         self.bayer_pattern = None
         self.preview_started = False
+        self.last_frame_exposure_us = None
 
         print("\nAvailable sensor modes:")
         for idx, mode in enumerate(self.sensor_modes):
@@ -717,6 +869,9 @@ class InteractiveCameraController:
         if self.config["enable_preview"]:
             self.start_preview_safely()
         self.camera.start()
+        # The sensor starts on the configured exposure, so the first settle check
+        # already knows which value a stale frame would be carrying.
+        self.last_frame_exposure_us = int(self.config["exposure_time"])
         append_capture_log(
             self.session_log_path,
             f"[SESSION START] {time.strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -738,7 +893,240 @@ class InteractiveCameraController:
         self.configure_camera()
         self.camera.start()
 
-    def capture(self, target_dir: str | None, target_name: str | None) -> dict:
+    def exposure_limits(self) -> tuple[int, int]:
+        """Sensor exposure range, intersected with the configured auto search range."""
+        low = int(self.config.get("auto_exposure_min", 100))
+        high = int(self.config.get("auto_exposure_max", 2000000))
+        try:
+            control_min, control_max, _ = self.camera.camera_controls["ExposureTime"]
+            low = max(low, int(control_min))
+            high = min(high, int(control_max))
+        except Exception as exc:
+            print(f"[WARN] Could not read ExposureTime limits from camera: {exc}")
+        if high < low:
+            high = low
+        return low, high
+
+    def grab_settled_raw(self, max_frames: int = 10, stall_frames: int = 4) -> tuple[np.ndarray, dict]:
+        """Return the first frame actually exposed with the currently configured time.
+
+        Control changes reach the sensor a few frames later, so a frame captured
+        right after set_controls() still carries the previous exposure. Frames are
+        discarded until the reported ExposureTime matches the request.
+
+        A request the sensor refuses (e.g. below its minimum line time) would never
+        match, so a repeated reading is also accepted as the real exposure - but only
+        after `stall_frames` identical readings of a value that differs from the one
+        in flight before the change. A shorter stall check cannot tell a clamp apart
+        from the normal control latency and would accept a stale frame.
+        """
+        requested = int(self.config["exposure_time"])
+        check_exposure = not bool(self.config["ae_enable"])
+        tolerance = max(2.0, 0.02 * requested)
+        pre_change_exposure = self.last_frame_exposure_us
+        previous_actual = None
+        stall = 0
+        raw = None
+        metadata = None
+        for _ in range(max(1, int(max_frames))):
+            with self.camera.captured_request() as request:
+                self.applied_config = self.camera.camera_configuration()
+                self.raw_config = self.applied_config["raw"]
+                raw = normalize_raw_array(request.make_array("raw"), self.raw_config)
+                metadata = request.get_metadata()
+            if not check_exposure:
+                break
+            actual = metadata.get("ExposureTime")
+            if actual is None:
+                break
+            self.last_frame_exposure_us = int(actual)
+            if abs(float(actual) - requested) <= tolerance:
+                break
+            stall = stall + 1 if actual == previous_actual else 1
+            previous_actual = actual
+            # Without a known pre-change exposure a repeated reading is ambiguous:
+            # it may be the clamp, or the old value still in flight. Keep discarding.
+            if pre_change_exposure is not None and stall >= int(stall_frames) and actual != pre_change_exposure:
+                print(f"[WARN] Sensor clamped exposure to {actual} us for request {requested} us.")
+                break
+        else:
+            if check_exposure and previous_actual is not None:
+                print(
+                    f"[WARN] Exposure did not settle after {max_frames} frames: "
+                    f"requested {requested} us, last frame reported {previous_actual} us."
+                )
+        return raw, metadata
+
+    def probe_exposure(self, exposure_us: int) -> dict:
+        """Apply an exposure, grab one settled frame and measure its headroom."""
+        low, high = self.exposure_limits()
+        exposure_us = int(np.clip(int(round(exposure_us)), low, high))
+        self.config["exposure_time"] = exposure_us
+        self.camera.set_controls(self.make_controls())
+        time.sleep(float(self.config.get("warmup", 0.2)))
+        raw, metadata = self.grab_settled_raw()
+
+        bit_depth = int(
+            self.applied_config.get("sensor", {}).get("bit_depth", normalize_bit_depth(self.config["bit_depth"]))
+        )
+        pattern = infer_bayer_pattern(self.raw_config["format"])
+        metrics = measure_exposure_metrics(
+            raw, metadata, bit_depth, pattern, int(self.config.get("auto_peak_pixels", 64))
+        )
+        metrics["requested_exposure_us"] = exposure_us
+        metrics["exposure_us"] = int(metadata.get("ExposureTime") or exposure_us)
+        metrics["analogue_gain"] = float(metadata.get("AnalogueGain") or self.config["analogue_gain"])
+        return metrics
+
+    def auto_exposure_search(self) -> dict:
+        """Search the exposure that fills the requested fraction of the sensor range.
+
+        The sensor is linear, so one measurement predicts the next exposure directly.
+        A bracket of known under/over exposures is kept alongside the prediction so a
+        clipped frame (where the measured fill is meaningless) cannot make it diverge.
+        """
+        target = float(self.config["auto_target_fill"])
+        fill_low = float(self.config["auto_fill_low"])
+        fill_high = float(self.config["auto_fill_high"])
+        max_saturated = int(self.config["auto_max_saturated_pixels"])
+        max_iterations = int(self.config["auto_max_iterations"])
+        limit_low, limit_high = self.exposure_limits()
+
+        exposure = int(np.clip(int(self.config["exposure_time"]), limit_low, limit_high))
+        under_bound = None  # highest exposure known to be too dim
+        over_bound = None  # lowest exposure known to be too bright / clipped
+        trace = []
+        best = None
+        status = "max_iterations"
+        clipped_streak = 0
+
+        for iteration in range(1, max_iterations + 1):
+            metrics = self.probe_exposure(exposure)
+            actual = metrics["exposure_us"]
+            fill = metrics["fill"]
+            saturated = metrics["saturated_pixels"]
+            clipped = saturated > max_saturated
+            step = {
+                "iteration": iteration,
+                "requested_exposure_us": metrics["requested_exposure_us"],
+                "exposure_us": actual,
+                "fill": fill,
+                "peak_channel": metrics["peak_channel"],
+                "saturated_pixels": saturated,
+                "saturated_fraction": metrics["saturated_fraction"],
+                "raw_max": metrics["raw_max"],
+            }
+            trace.append(step)
+            print(
+                f"  [auto {iteration}/{max_iterations}] exp={actual} us  fill={fill:.3f}"
+                f" ({metrics['peak_channel']})  saturated={saturated}"
+            )
+
+            if not clipped and (best is None or fill > best["fill"]) and fill <= fill_high:
+                best = {"exposure_us": actual, "fill": fill, "metrics": metrics}
+
+            if not clipped and fill_low <= fill <= fill_high:
+                status = "converged"
+                best = {"exposure_us": actual, "fill": fill, "metrics": metrics}
+                break
+
+            clipped_streak = clipped_streak + 1 if clipped else 0
+            if clipped or fill > fill_high:
+                over_bound = actual if over_bound is None else min(over_bound, actual)
+            else:
+                under_bound = actual if under_bound is None else max(under_bound, actual)
+
+            predicted = predict_exposure(actual, metrics, target, max_saturated, clipped_streak)
+
+            # Keep the prediction inside the bracket; fall back to bisection otherwise.
+            if under_bound is not None and over_bound is not None and under_bound < over_bound:
+                if not (under_bound < predicted < over_bound):
+                    predicted = float(np.sqrt(under_bound * over_bound))
+            elif over_bound is not None and predicted >= over_bound:
+                predicted = over_bound * 0.7
+            elif under_bound is not None and predicted <= under_bound:
+                predicted = under_bound * 1.4
+
+            next_exposure = int(np.clip(int(round(predicted)), limit_low, limit_high))
+
+            if next_exposure == exposure:
+                if fill < fill_low and next_exposure >= limit_high:
+                    status = "underexposed_at_exposure_limit"
+                elif clipped and next_exposure <= limit_low:
+                    status = "saturated_at_exposure_limit"
+                else:
+                    status = "exposure_step_quantized"
+                break
+            exposure = next_exposure
+
+        if best is None:
+            # Every probe clipped: fall back to the dimmest exposure that was tried.
+            fallback = min((step["exposure_us"] for step in trace), default=exposure)
+            best = {"exposure_us": int(fallback), "fill": float("nan"), "metrics": None}
+            if status == "converged":
+                status = "no_unsaturated_exposure_found"
+
+        chosen = int(best["exposure_us"])
+        chosen_fill = best["fill"]
+        known_fill = chosen_fill == chosen_fill  # False only for NaN
+        fill_text = f"{chosen_fill:.4f}" if known_fill else "n/a"
+        self.config["exposure_time"] = chosen
+        self.camera.set_controls(self.make_controls())
+
+        result = {
+            "status": status,
+            "chosen_exposure_us": chosen,
+            "chosen_fill": chosen_fill if known_fill else None,
+            "target_fill": target,
+            "accept_band": [fill_low, fill_high],
+            "max_saturated_pixels": max_saturated,
+            "iterations": len(trace),
+            "exposure_search_limits_us": [limit_low, limit_high],
+            "analogue_gain": float(self.config["analogue_gain"]),
+            "trace": trace,
+        }
+        append_capture_log(
+            self.session_log_path,
+            f"[AUTOEXP] {time.strftime('%Y-%m-%d %H:%M:%S')} | status={status} | "
+            f"exp_us={chosen} | fill={fill_text} | iterations={len(trace)}",
+        )
+        return result
+
+    def auto_capture(self, target_dir: str | None, target_name: str | None) -> dict:
+        print("\nAuto exposure search started "
+              f"(target fill={self.config['auto_target_fill']}, "
+              f"band=[{self.config['auto_fill_low']}, {self.config['auto_fill_high']}])")
+        started = time.time()
+        search = self.auto_exposure_search()
+        elapsed = time.time() - started
+        search["elapsed_seconds"] = round(elapsed, 3)
+
+        if search["status"] != "converged":
+            print(f"[WARN] Auto exposure did not converge: {search['status']}. "
+                  f"Capturing with the best exposure found ({search['chosen_exposure_us']} us).")
+
+        stem = target_name or f"auto_{time.strftime('%Y%m%d-%H%M%S')}"
+        payload = self.capture(
+            target_dir,
+            stem,
+            with_histogram=bool(self.config.get("auto_save_histogram", True)),
+            extra={"auto_exposure": search},
+        )
+        fill = search["chosen_fill"]
+        print(
+            f"\nAuto exposure done in {elapsed:.1f}s: exposure={search['chosen_exposure_us']} us, "
+            f"fill={f'{fill:.3f}' if fill is not None else 'n/a'}, status={search['status']}"
+        )
+        print_saturation_summary(payload.get("saturation", {}))
+        return payload
+
+    def capture(
+        self,
+        target_dir: str | None,
+        target_name: str | None,
+        with_histogram: bool = False,
+        extra: dict | None = None,
+    ) -> dict:
         dir_name = sanitize_filename(target_dir) if target_dir else sanitize_filename(self.config["default_capture_dir"])
         stem = sanitize_filename(target_name)
         folder = self.save_root / dir_name
@@ -747,11 +1135,7 @@ class InteractiveCameraController:
 
         self.camera.set_controls(self.make_controls())
         time.sleep(float(self.config.get("warmup", 0.2)))
-        with self.camera.captured_request() as request:
-            self.applied_config = self.camera.camera_configuration()
-            self.raw_config = self.applied_config["raw"]
-            raw = normalize_raw_array(request.make_array("raw"), self.raw_config)
-            metadata = request.get_metadata()
+        raw, metadata = self.grab_settled_raw()
 
         bit_depth = int(self.applied_config.get("sensor", {}).get("bit_depth", normalize_bit_depth(self.config["bit_depth"])))
         pattern = infer_bayer_pattern(self.raw_config["format"])
@@ -762,17 +1146,39 @@ class InteractiveCameraController:
         preview = robust_preview_png(rgb16)
 
         raw_path = dirs["raw"] / f"{stem}.raw_uint.npy"
-        linear_path = dirs["linear"] / f"{stem}.linear_float32.npy"
+        # linear_path = dirs["linear"] / f"{stem}.linear_float32.npy"
         planes_path = dirs["planes"] / f"{stem}.planes_float32.npz"
         preview_path = dirs["preview"] / f"{stem}.preview.png"
-        tiff_path = dirs["tiff"] / f"{stem}.linear_float32.tiff"
+        # tiff_path = dirs["tiff"] / f"{stem}.linear_float32.tiff"
         meta_path = dirs["log"] / f"{stem}.metadata.json"
 
         np.save(raw_path, raw)
-        np.save(linear_path, linear.astype(np.float32, copy=False))
+        # np.save(linear_path, linear.astype(np.float32, copy=False))
         np.savez_compressed(planes_path, **planes)
         cv2.imwrite(str(preview_path), cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
-        tiff_ok = write_float32_tiff_best_effort(tiff_path, rgb16)
+        # tiff_ok = write_float32_tiff_best_effort(tiff_path, rgb16)
+
+        rgb_hist_path = None
+        cfa_hist_path = None
+        if with_histogram:
+            # Histograms come from the frame that was just saved, so no extra capture.
+            hist_dir = folder / "histogram"
+            hist_dir.mkdir(parents=True, exist_ok=True)
+            rgb_hist_path = hist_dir / f"{stem}.rgb_histogram.png"
+            cfa_hist_path = hist_dir / f"{stem}.cfa_histogram.png"
+            save_figure(
+                make_rgb_histogram_figure(rgb16, title=f"Linear RGB Histogram: {stem}"),
+                rgb_hist_path,
+            )
+            save_figure(
+                make_cfa_histogram_figure(
+                    planes,
+                    bit_depth,
+                    title=f"Linear CFA Histogram: {stem}",
+                    saturation_limits=saturation_limits_from_stats(saturation_stats),
+                ),
+                cfa_hist_path,
+            )
 
         payload = {
             "dir": dir_name,
@@ -793,13 +1199,17 @@ class InteractiveCameraController:
             "saturation": saturation_stats,
             "paths": {
                 "raw_uint_npy": str(raw_path),
-                "linear_float32_npy": str(linear_path),
+                # "linear_float32_npy": str(linear_path),
                 "planes_float32_npz": str(planes_path),
                 "preview_png": str(preview_path),
-                "linear_float32_tiff": str(tiff_path) if tiff_ok else None,
+                # "linear_float32_tiff": str(tiff_path) if tiff_ok else None,
                 "metadata_json": str(meta_path),
+                "rgb_histogram_png": str(rgb_hist_path) if rgb_hist_path else None,
+                "cfa_histogram_png": str(cfa_hist_path) if cfa_hist_path else None,
             },
         }
+        if extra:
+            payload.update(extra)
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(json_safe(payload), handle, indent=2, ensure_ascii=False)
         append_capture_log(
@@ -817,11 +1227,7 @@ class InteractiveCameraController:
 
         self.camera.set_controls(self.make_controls())
         time.sleep(float(self.config.get("warmup", 0.2)))
-        with self.camera.captured_request() as request:
-            self.applied_config = self.camera.camera_configuration()
-            self.raw_config = self.applied_config["raw"]
-            raw = normalize_raw_array(request.make_array("raw"), self.raw_config)
-            metadata = request.get_metadata()
+        raw, metadata = self.grab_settled_raw()
 
         bit_depth = int(self.applied_config.get("sensor", {}).get("bit_depth", normalize_bit_depth(self.config["bit_depth"])))
         pattern = infer_bayer_pattern(self.raw_config["format"])
@@ -906,6 +1312,15 @@ class InteractiveCameraController:
         print(f"  colour_gains    : {self.config['colour_gains']}")
         print(f"  applied_raw     : {self.raw_config['format'] if self.raw_config else None}")
         print(f"  bayer_pattern   : {self.bayer_pattern}")
+        print(
+            f"  auto_exposure   : target_fill={self.config['auto_target_fill']} "
+            f"band=[{self.config['auto_fill_low']}, {self.config['auto_fill_high']}] "
+            f"max_sat_px={self.config['auto_max_saturated_pixels']} "
+            f"max_iter={self.config['auto_max_iterations']} "
+            f"range_us=[{self.config['auto_exposure_min']}, {self.config['auto_exposure_max']}] "
+            f"peak_px={self.config['auto_peak_pixels']} "
+            f"histogram={self.config['auto_save_histogram']}"
+        )
 
     def close(self):
         try:
@@ -940,6 +1355,12 @@ def parse_interactive_command(line: str):
         if len(parts) >= 2 and parts[1]:
             return command, None, parts[1]
         return command, None, None
+    if command in {"hhh", "auto"}:
+        if len(parts) == 1:
+            return "hhh", None, None
+        if len(parts) == 2:
+            return "hhh", None, parts[1] or None
+        return "hhh", parts[1] or None, ",".join(parts[2:]).strip() or None
     if command in {"status", "quit"}:
         return command, None, None
     raise ValueError(f"Unknown command: {command}")
@@ -953,8 +1374,11 @@ def print_command_help(mode: str):
     print("  p")
     print("  setup,config,value")
     print("  status")
-    print("  histogram")
-    print("  histogram,name")
+    print("  h              (histogram only, current exposure)")
+    print("  h,name")
+    print("  hhh            (auto exposure search + capture + histogram)")
+    print("  hhh,name")
+    print("  hhh,dir,name")
     print("  quit")
 
 
@@ -972,6 +1396,18 @@ def execute_interactive_command(controller: InteractiveCameraController, line: s
     if command == "h":
         result = controller.save_histogram(arg2)
         return format_response("OK", "histogram saved", command=command, result=result), False
+    if command == "hhh":
+        result = controller.auto_capture(arg1, arg2)
+        return (
+            format_response(
+                "OK",
+                "auto exposure capture completed",
+                command=command,
+                auto_exposure=result.get("auto_exposure"),
+                result=result,
+            ),
+            False,
+        )
     return format_response("OK", "shutdown requested", command=command), True
 
 
@@ -981,7 +1417,9 @@ def run_test_mode(controller: InteractiveCameraController):
     print("  capture,red-led,04p0")
     print("  capture,04p0")
     print("  setup,exposure_time,200000")
-    print("  histogram")
+    print("  h")
+    print("  hhh,red-led,04p0")
+    print("  setup,auto_target_fill,0.9")
     while True:
         line = input("\nCommand >> ").strip()
         if not line:
