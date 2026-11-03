@@ -1,0 +1,29 @@
+{
+  "save_root": "/home/pi/Desktop/data/261103_camB_raw_measurement",
+  "capture_dir": "T2_further",
+  "capture_name": "camB",
+  "max_mm": 19.9,
+  "fine_step_mm": 0.1,
+  "coarse_step_mm": 1.0,
+  "wd_memo": "5.0",
+  "grid": true,
+  "live_hist": true,
+  "formats": {
+    "raw_npy": true,
+    "planes_npz": true,
+    "preview_png": true,
+    "linear_npy": true,
+    "tiff_float32": false,
+    "histogram_png": true
+  },
+  "sweep": {
+    "start": 13.49,
+    "stop": 12.89,
+    "step": 0.1,
+    "settle": 0.8999999999999999,
+    "burst": 5,
+    "auto_exposure": true,
+    "dir": "",
+    "prefix": "cam2_"
+  }
+}

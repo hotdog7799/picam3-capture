@@ -1,0 +1,25 @@
+{
+  "camera_index": null,
+  "save_root": "/home/pi/Desktop/261023-R2[20260928mask]-tooth/",
+  "default_capture_dir": "T1-02",
+  "bit_depth": "10",
+  "preview_size": [
+    1280,
+    720
+  ],
+  "exposure_time": 210,
+  "analogue_gain": 1.0,
+  "ae_enable": false,
+  "awb_enable": false,
+  "colour_gains": [
+    1.0,
+    1.0
+  ],
+  "enable_preview": true,
+  "burst_count": 3,
+  "burst_delay_min": 0.4,
+  "burst_delay_max": 1.2,
+  "serial_port": "/dev/serial0",
+  "serial_baudrate": 115200,
+  "serial_timeout": 3.0
+}

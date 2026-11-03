@@ -8,3 +8,19 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Capture output never belongs in the repo (lives under save_root, synced to the lab NAS)
+*.npy
+*.npz
+*.tif
+*.tiff
+raw/
+planes/
+preview/
+histogram/
+linear/
+log/
+_linear_session_log.txt
+_sweep_*.csv
+_sweep_*.json
+*.metadata.json
